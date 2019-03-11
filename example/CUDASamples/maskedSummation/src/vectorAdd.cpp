@@ -30,15 +30,6 @@
  * number of elements numElements.
  */
 
-#define DETECTOR_SIZE (128 * 128)
-//#define SCAN_SIZE (128 * 64)
-#define SCAN_SIZE (3 * 3)
-#define NUM_MASKS 2
-
-#define RESULT_SIZE (NUM_MASKS * SCAN_SIZE)
-#define DATASET_SIZE (SCAN_SIZE * DETECTOR_SIZE)
-#define MASKS_SIZE (NUM_MASKS * DETECTOR_SIZE / 8)
-
 typedef float result_t;
 typedef float pixel_t;
 typedef char mask_t;
@@ -47,8 +38,8 @@ struct maskedSum
 {
     template <typename T_Acc, class PixelType>
     ALPAKA_FN_HOST_ACC void operator()(T_Acc const &acc,
-                                       const PixelType *images, PixelType *result, char *masks,
-                                       int numMasks, int scanSize) const
+                                       const PixelType *images, PixelType *result, mask_t *masks,
+                                       int numMasks, int scanSize, int detectorSize) const
     {
         int mask = blockDim.x * blockIdx.x * elemDim.x + threadIdx.x * elemDim.x;
         int f = blockDim.y * blockIdx.y * elemDim.y + threadIdx.y * elemDim.y;
@@ -56,33 +47,35 @@ struct maskedSum
         int numThreadsX = blockDim.x * gridDim.x;*/
         int resultIdx = mask * scanSize + f;
 
-        printf("resultIdx=%d elemDim.x=%d elemDim.y=%d\n", resultIdx, elemDim.x, elemDim.y);
+        //printf("resultIdx=%d elemDim.x=%d elemDim.y=%d\n", resultIdx, elemDim.x, elemDim.y);
 
         if (mask >= numMasks || f >= scanSize)
         {
             return;
         }
 
+        const int numMaskBits = sizeof(mask_t) * 8;
+
         PixelType res = 0;
-        for (int p = 0; p < DETECTOR_SIZE / 8; p++)
+        for (int p = 0; p < detectorSize / numMaskBits; p++)
         {
-            mask_t maskbyte = masks[(DETECTOR_SIZE / 8) * mask + p];
-            int kMax = min(8, DETECTOR_SIZE - p);
-            for (int k = 0; k < 8; k++)
+            mask_t maskbyte = masks[(detectorSize / numMaskBits) * mask + p];
+/*
+            int kMax = min(numMaskBits, detectorSize - p);
+            for (int k = 0; k < numMaskBits; k++)
             {
-                res += (maskbyte & 1 << (7 - k)) ? images[DETECTOR_SIZE * f + p + k] : 0;
+                res += (maskbyte & 1 << ((numMaskBits - 1) - k)) ? images[detectorSize * f + p + k] : 0;
             }
-            /*
-            PixelType r0 = (maskbyte & 0x80) ? images[DETECTOR_SIZE * f + p + 0] : 0;
-            PixelType r1 = (maskbyte & 0x40) ? images[DETECTOR_SIZE * f + p + 1] : 0;
-            PixelType r2 = (maskbyte & 0x20) ? images[DETECTOR_SIZE * f + p + 2] : 0;
-            PixelType r3 = (maskbyte & 0x10) ? images[DETECTOR_SIZE * f + p + 3] : 0;
-            PixelType r4 = (maskbyte & 0x08) ? images[DETECTOR_SIZE * f + p + 4] : 0;
-            PixelType r5 = (maskbyte & 0x04) ? images[DETECTOR_SIZE * f + p + 5] : 0;
-            PixelType r6 = (maskbyte & 0x02) ? images[DETECTOR_SIZE * f + p + 6] : 0;
-            PixelType r7 = (maskbyte & 0x01) ? images[DETECTOR_SIZE * f + p + 7] : 0;
+*/
+            PixelType r0 = (maskbyte & 0x80) ? images[detectorSize*f + p + 0] : 0;
+            PixelType r1 = (maskbyte & 0x40) ? images[detectorSize*f + p + 1] : 0;
+            PixelType r2 = (maskbyte & 0x20) ? images[detectorSize*f + p + 2] : 0;
+            PixelType r3 = (maskbyte & 0x10) ? images[detectorSize*f + p + 3] : 0;
+            PixelType r4 = (maskbyte & 0x08) ? images[detectorSize*f + p + 4] : 0;
+            PixelType r5 = (maskbyte & 0x04) ? images[detectorSize*f + p + 5] : 0;
+            PixelType r6 = (maskbyte & 0x02) ? images[detectorSize*f + p + 6] : 0;
+            PixelType r7 = (maskbyte & 0x01) ? images[detectorSize*f + p + 7] : 0;
             res += r0 + r1 + r2 + r3 + r4 + r5 + r6 + r7;
-            */
         }
         result[resultIdx] = res;
     }
@@ -96,10 +89,66 @@ int main(int argc, char *argv[])
     // Error code to check return values for CUDA calls
     cudaError_t err = cudaSuccess;
 
-    // init results:
-    result_t *results = (result_t *)malloc(sizeof(result_t) * RESULT_SIZE);
-    mask_t *maskbuf = (mask_t *)malloc(sizeof(mask_t) * MASKS_SIZE);
-    pixel_t *dataset = (pixel_t *)malloc(sizeof(pixel_t) * DATASET_SIZE);
+
+    using boost::lexical_cast;
+    using boost::bad_lexical_cast;
+    std::vector<int> args;
+    while (*++argv){
+        try{
+            args.push_back(lexical_cast<int>(*argv));
+        }
+        catch( const bad_lexical_cast &){
+            args.push_back(0);
+        }
+    }
+
+/*
+    int detectorSize = 128 * 128;       // pixels per frame
+    int scanSize = 256 * 256;           // frames per dataset
+    int numMasks = 2;
+*/
+
+    if(args.size() != 4) {
+        fprintf(stderr, "usage: ./NAME [detectorSize] [scanSize] [numMasks] [numStreams]\n");
+        exit(1);
+    }
+
+
+    int detectorSize = args[0];
+    int scanSize = args[1];
+    int numMasks = args[2];
+    const int numStreams = args[3];
+
+    printf("parameters: detectorSize=%d scanSize=%d numMasks=%d\n",
+            detectorSize, scanSize, numMasks);
+
+    size_t datasetSize = scanSize * detectorSize; // pixels per dataset
+    size_t resultSize = numMasks * scanSize;      // number of result items
+    const int numMaskBits = sizeof(mask_t) * 8;
+    int masksSize = numMasks * detectorSize / numMaskBits;
+
+    int streamSize = datasetSize / numStreams;
+    int resultStreamSize = resultSize / numStreams;
+
+    if(datasetSize % numStreams != 0 || scanSize % numStreams != 0) {
+        fprintf(stderr, "FIXME: datasetSize or scanSize not divisible by numStreams\n");
+        exit(1);
+    }
+
+
+    printf("allocating host memory: %ld bytes\n", sizeof(result_t) * resultSize + sizeof(mask_t) * masksSize
+        + sizeof(pixel_t) * datasetSize);
+
+    // init host buffers:
+    result_t *results;
+    mask_t *maskbuf;
+    pixel_t *dataset;
+
+    cuplaMallocHost((void**)&results, sizeof(result_t) * resultSize);
+    cuplaMallocHost((void**)&maskbuf, sizeof(mask_t) * masksSize);
+    cuplaMallocHost((void**)&dataset, sizeof(pixel_t) * datasetSize);
+
+    printf("allocated host memory\n");
 
     // Verify that allocations succeeded
     if (dataset == NULL || maskbuf == NULL || results == NULL)
@@ -108,26 +157,43 @@ int main(int argc, char *argv[])
         exit(EXIT_FAILURE);
     }
 
-    for (int i = 0; i < RESULT_SIZE; i++)
+    for (int i = 0; i < resultSize; i++)
     {
         results[i] = 0;
     }
 
     // init masks
-    for (int i = 0; i < MASKS_SIZE; i++)
+    for (int i = 0; i < masksSize; i++)
     {
         maskbuf[i] = 0xFF;
     }
 
     // init source data buffer
-    for (int i = 0; i < DATASET_SIZE; i++)
+    for (size_t i = 0; i < datasetSize; i++)
     {
         dataset[i] = 1;
     }
 
+    printf("allocating device memory\n");
+
+
+    std::vector<cuplaStream_t> streams;
+
+    for(int i = 0; i < numStreams; i++) {
+        cuplaStream_t stream;
+        err = cudaStreamCreate(&stream);
+        streams.push_back(stream);
+
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr, "failed to create stream (error code %s)!\n", cudaGetErrorString(err));
+            exit(EXIT_FAILURE);
+        }
+    }
+
     // Allocate the device input vector dataset
     pixel_t *d_dataset = NULL;
-    err = cudaMalloc((void **)&d_dataset, sizeof(pixel_t) * DATASET_SIZE);
+    err = cudaMalloc((void **)&d_dataset, sizeof(pixel_t) * datasetSize);
 
     if (err != cudaSuccess)
     {
@@ -137,7 +203,7 @@ int main(int argc, char *argv[])
 
     // Allocate the device input vector maskbuf
     mask_t *d_maskbuf = NULL;
-    err = cudaMalloc((void **)&d_maskbuf, sizeof(mask_t) * MASKS_SIZE);
+    err = cudaMalloc((void **)&d_maskbuf, sizeof(mask_t) * masksSize);
 
     if (err != cudaSuccess)
     {
@@ -147,7 +213,7 @@ int main(int argc, char *argv[])
 
     // Allocate the device output vector results
     float *d_results = NULL;
-    err = cudaMalloc((void **)&d_results, sizeof(result_t) * RESULT_SIZE);
+    err = cudaMalloc((void **)&d_results, sizeof(result_t) * resultSize);
 
     if (err != cudaSuccess)
     {
@@ -155,18 +221,7 @@ int main(int argc, char *argv[])
         exit(EXIT_FAILURE);
     }
 
-    // Copy the host input vectors dataset and masks in host memory to the device input vectors in
-    // device memory
-    printf("Copy input data from the host memory to the CUDA device\n");
-    err = cudaMemcpy(d_dataset, dataset, DATASET_SIZE * sizeof(pixel_t), cudaMemcpyHostToDevice);
-
-    if (err != cudaSuccess)
-    {
-        fprintf(stderr, "Failed to copy vector dataset from host to device (error code %s)!\n", cudaGetErrorString(err));
-        exit(EXIT_FAILURE);
-    }
-
-    err = cudaMemcpy(d_maskbuf, maskbuf, MASKS_SIZE * sizeof(mask_t), cudaMemcpyHostToDevice);
+    err = cudaMemcpy(d_maskbuf, maskbuf, masksSize * sizeof(mask_t), cudaMemcpyHostToDevice);
 
     if (err != cudaSuccess)
     {
@@ -175,44 +230,80 @@ int main(int argc, char *argv[])
     }
 
     // Launch the CUDA Kernel
-    //dim3 threadsPerBlock(16, 8);
-    dim3 threadsPerBlock(2, 1);
+    dim3 threadsPerBlock(4, 64);
+    //dim3 threadsPerBlock(2, 1);
     //dim3 threadsPerBlock(1, 1);
+    //
+
+    std::chrono::high_resolution_clock::time_point start =
+        std::chrono::high_resolution_clock::now();
 
     dim3 blocksPerGrid(
-        // ceil(NUM_MASKS, threadsPerBlock.x)
-        (NUM_MASKS + threadsPerBlock.x - 1) / threadsPerBlock.x,
-        // ceil(SCAN_SIZE, threadsPerBlock.y)
-        (SCAN_SIZE + threadsPerBlock.y - 1) / threadsPerBlock.y);
+        // ceil(numMasks, threadsPerBlock.x)
+        (numMasks + threadsPerBlock.x - 1) / threadsPerBlock.x,
+        // ceil(scanSize, threadsPerBlock.y)
+        (scanSize + threadsPerBlock.y - 1) / threadsPerBlock.y);
     //printf("CUDA kernel launch with %d blocks of %d threads\n", blocksPerGrid, threadsPerBlock);
     //CUPLA_KERNEL_OPTI(maskedSum)
-    CUPLA_KERNEL(maskedSum)
-    (blocksPerGrid, threadsPerBlock, 0, 0)(d_dataset, d_results, d_maskbuf, NUM_MASKS, SCAN_SIZE);
-    err = cudaGetLastError();
 
-    if (err != cudaSuccess)
-    {
-        fprintf(stderr, "Failed to launch vectorAdd kernel (error code %s)!\n", cudaGetErrorString(err));
-        exit(EXIT_FAILURE);
+    for (int repeat = 0; repeat < 1; repeat++) {
+        for (int stream = 0; stream < numStreams; stream++) {
+            // Copy the host input vectors dataset and masks in host memory to the device input vectors in
+            // device memory
+            //printf("Copy input data from the host memory to the CUDA device\n");
+            int offset = stream * streamSize;
+            int resultOffset = stream * resultStreamSize;
+
+            err = cudaMemcpyAsync(
+                &d_dataset[offset], &dataset[offset],
+                streamSize * sizeof(pixel_t),
+                cudaMemcpyHostToDevice,
+                streams[stream]
+            );
+
+            if (err != cudaSuccess)
+            {
+                fprintf(stderr, "Failed to copy vector dataset from host to device (error code %s)!\n", cudaGetErrorString(err));
+                exit(EXIT_FAILURE);
+            }
+
+            CUPLA_KERNEL(maskedSum)
+            (blocksPerGrid, threadsPerBlock, 0, streams[stream])(&d_dataset[offset], &d_results[resultOffset], d_maskbuf, numMasks, scanSize / numStreams, detectorSize);
+            err = cudaGetLastError();
+
+            if (err != cudaSuccess)
+            {
+                fprintf(stderr, "Failed to launch vectorAdd kernel (error code %s)!\n", cudaGetErrorString(err));
+                exit(EXIT_FAILURE);
+            }
+
+            // Copy the device result vector in device memory to the host result vector
+            // in host memory.
+            //printf("Copy output data from the CUDA device to the host memory\n");
+            err = cudaMemcpyAsync(&results[resultOffset], &d_results[resultOffset],
+                    sizeof(result_t) * resultStreamSize, cudaMemcpyDeviceToHost, streams[stream]);
+
+            if (err != cudaSuccess)
+            {
+                fprintf(stderr, "Failed to copy vector C from device to host (error code %s)!\n", cudaGetErrorString(err));
+                exit(EXIT_FAILURE);
+            }
+        }
+        cudaDeviceSynchronize();
     }
 
-    // Copy the device result vector in device memory to the host result vector
-    // in host memory.
-    printf("Copy output data from the CUDA device to the host memory\n");
-    err = cudaMemcpy(results, d_results, sizeof(result_t) * RESULT_SIZE, cudaMemcpyDeviceToHost);
+    std::chrono::high_resolution_clock::time_point end =
+        std::chrono::high_resolution_clock::now();
 
-    if (err != cudaSuccess)
-    {
-        fprintf(stderr, "Failed to copy vector C from device to host (error code %s)!\n", cudaGetErrorString(err));
-        exit(EXIT_FAILURE);
-    }
+    std::cout << "Time: "<< std::chrono::duration_cast<std::chrono::milliseconds>(end-start).count() << "ms" << std::endl;
+    
 
     // Verify that the result vector is correct
-    for (int i = 0; i < RESULT_SIZE; ++i)
+    for (int i = 0; i < resultSize; ++i)
     {
-        if (results[i] != DETECTOR_SIZE)
+        if (results[i] != detectorSize)
         {
-            fprintf(stderr, "Result verification failed at element %d value was %f, expected %d!\n", i, results[i], DETECTOR_SIZE);
+            fprintf(stderr, "Result verification failed at element %d value was %f, expected %d!\n", i, results[i], detectorSize);
             exit(EXIT_FAILURE);
         }
     }
@@ -244,9 +335,9 @@ int main(int argc, char *argv[])
     }
 
     // Free host memory
-    free(dataset);
-    free(maskbuf);
-    free(results);
+    cuplaFreeHost(dataset);
+    cuplaFreeHost(maskbuf);
+    cuplaFreeHost(results);
 
     // Reset the device and exit
     // cudaDeviceReset causes the driver to clean up all state. While
