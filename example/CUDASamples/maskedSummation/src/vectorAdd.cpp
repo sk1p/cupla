@@ -19,6 +19,7 @@
 #include <iostream> //std:cout
 // For the CUDA runtime routines (prefixed with "cuda_")
 #include <cuda_to_cupla.hpp>
+#include <cuda_profiler_api.h>
 //Timer for test purpose
 #include <chrono>
 #include <boost/lexical_cast.hpp>
@@ -235,6 +236,7 @@ int main(int argc, char *argv[])
     //dim3 threadsPerBlock(1, 1);
     //
 
+    cudaProfilerStart();
     std::chrono::high_resolution_clock::time_point start =
         std::chrono::high_resolution_clock::now();
 
@@ -246,54 +248,57 @@ int main(int argc, char *argv[])
     //printf("CUDA kernel launch with %d blocks of %d threads\n", blocksPerGrid, threadsPerBlock);
     //CUPLA_KERNEL_OPTI(maskedSum)
 
-    for (int repeat = 0; repeat < 1; repeat++) {
-        for (int stream = 0; stream < numStreams; stream++) {
-            // Copy the host input vectors dataset and masks in host memory to the device input vectors in
-            // device memory
-            //printf("Copy input data from the host memory to the CUDA device\n");
-            int offset = stream * streamSize;
-            int resultOffset = stream * resultStreamSize;
 
-            err = cudaMemcpyAsync(
-                &d_dataset[offset], &dataset[offset],
-                streamSize * sizeof(pixel_t),
-                cudaMemcpyHostToDevice,
-                streams[stream]
-            );
+    for (int stream = 0; stream < 1; stream++) {
+        int offset = stream * streamSize;
 
-            if (err != cudaSuccess)
-            {
-                fprintf(stderr, "Failed to copy vector dataset from host to device (error code %s)!\n", cudaGetErrorString(err));
-                exit(EXIT_FAILURE);
-            }
+        err = cudaMemcpyAsync(
+            &d_dataset[offset], &dataset[offset],
+            streamSize * sizeof(pixel_t),
+            cudaMemcpyHostToDevice,
+            streams[stream]
+        );
 
-            CUPLA_KERNEL(maskedSum)
-            (blocksPerGrid, threadsPerBlock, 0, streams[stream])(&d_dataset[offset], &d_results[resultOffset], d_maskbuf, numMasks, scanSize / numStreams, detectorSize);
-            err = cudaGetLastError();
+        int resultOffset = stream * resultStreamSize;
+        CUPLA_KERNEL(maskedSum)
+        (blocksPerGrid, threadsPerBlock, 0, streams[stream])(&d_dataset[offset], &d_results[resultOffset], d_maskbuf, numMasks, scanSize / numStreams, detectorSize);
+        err = cudaGetLastError();
 
-            if (err != cudaSuccess)
-            {
-                fprintf(stderr, "Failed to launch vectorAdd kernel (error code %s)!\n", cudaGetErrorString(err));
-                exit(EXIT_FAILURE);
-            }
 
-            // Copy the device result vector in device memory to the host result vector
-            // in host memory.
-            //printf("Copy output data from the CUDA device to the host memory\n");
-            err = cudaMemcpyAsync(&results[resultOffset], &d_results[resultOffset],
-                    sizeof(result_t) * resultStreamSize, cudaMemcpyDeviceToHost, streams[stream]);
-
-            if (err != cudaSuccess)
-            {
-                fprintf(stderr, "Failed to copy vector C from device to host (error code %s)!\n", cudaGetErrorString(err));
-                exit(EXIT_FAILURE);
-            }
-        }
-        cudaDeviceSynchronize();
+        err = cudaMemcpyAsync(&results[resultOffset], &d_results[resultOffset],
+                sizeof(result_t) * resultStreamSize, cudaMemcpyDeviceToHost, streams[stream]);
     }
+
+    for (int stream = 1; stream < numStreams; stream++) {
+        int offset = stream * streamSize;
+
+        err = cudaMemcpyAsync(
+            &d_dataset[offset], &dataset[offset],
+            streamSize * sizeof(pixel_t),
+            cudaMemcpyHostToDevice,
+            streams[stream]
+        );
+    }
+
+    for (int stream = 1; stream < numStreams; stream++) {
+        int offset = stream * streamSize;
+        int resultOffset = stream * resultStreamSize;
+        CUPLA_KERNEL(maskedSum)
+        (blocksPerGrid, threadsPerBlock, 0, streams[stream])(&d_dataset[offset], &d_results[resultOffset], d_maskbuf, numMasks, scanSize / numStreams, detectorSize);
+        err = cudaGetLastError();
+
+
+        err = cudaMemcpyAsync(&results[resultOffset], &d_results[resultOffset],
+                sizeof(result_t) * resultStreamSize, cudaMemcpyDeviceToHost, streams[stream]);
+    }
+
+
+    cudaDeviceSynchronize();
 
     std::chrono::high_resolution_clock::time_point end =
         std::chrono::high_resolution_clock::now();
+
+    cudaProfilerStop();
 
     std::cout << "Time: "<< std::chrono::duration_cast<std::chrono::milliseconds>(end-start).count() << "ms" << std::endl;
     
